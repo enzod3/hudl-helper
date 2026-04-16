@@ -1,4 +1,4 @@
-# DB Scouting Dashboard
+# Hudl Helper
 
 Apriori-based route tendency mining from Hudl film data. Built for DB coaches and defensive coordinators.
 

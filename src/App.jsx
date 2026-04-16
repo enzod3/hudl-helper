@@ -316,7 +316,7 @@ function FieldRangeSlider({ range, onChange }) {
 let _id = 1;
 const uid = () => `${Date.now()}-${_id++}`;
 
-export default function ScoutingDashboard() {
+export default function HudlHelper() {
   const [games, setGames] = useState([]);
   const [expandedGame, setExpandedGame] = useState(null);
   const [editingLabel, setEditingLabel] = useState(null);
