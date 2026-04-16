@@ -1,4 +1,4 @@
-import { useState, useMemo, useCallback, useRef } from "react";
+import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { aprioriMine } from "./apriori";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
 
@@ -342,6 +342,27 @@ export default function HudlHelper() {
 
   const fileRefs = useRef({});
 
+  // Auto-load sample film for testing / demo
+  useEffect(() => {
+    let cancelled = false;
+    fetch("sample-film/jhclips.json")
+      .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+      .then((json) => {
+        if (cancelled) return;
+        const prepped = prepRows(parseHudlJson(json));
+        const id = uid();
+        setGames([{
+          id,
+          label: "Sample: JH Clips",
+          enabled: true,
+          files: [{ id: uid(), fileName: "jhclips.json", rows: prepped }],
+        }]);
+        setExpandedGame(id);
+      })
+      .catch(() => { /* sample file not present — ignore */ });
+    return () => { cancelled = true; };
+  }, []);
+
   const createGame = (label) => {
     if (!label.trim()) return;
     const id = uid();
@@ -472,7 +493,7 @@ export default function HudlHelper() {
         <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
           <div style={{ width: 8, height: 28, background: ACCENT, borderRadius: 2 }} />
           <div>
-            <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 18, color: "#FFF", letterSpacing: "-0.02em" }}>DB TENDENCY FINDER</div>
+            <div style={{ fontFamily: "'Space Grotesk', sans-serif", fontWeight: 700, fontSize: 18, color: "#FFF", letterSpacing: "-0.02em" }}>HUDL HELPER</div>
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -593,27 +614,22 @@ export default function HudlHelper() {
                   <input type="range" min={2} max={20} value={minPlays} onChange={(e) => { setMinPlays(Number(e.target.value)); setExpandedRow(null); }}
                     style={{ width: 120, accentColor: ACCENT, pointerEvents: "all" }} />
                 </div>
-                <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "8px 12px", display: "flex", flexDirection: "column", gap: 8 }}>
-                  <span style={{ fontSize: 10, color: ACCENT, textTransform: "uppercase", letterSpacing: "0.06em", fontWeight: 600 }}>Utility Configuration</span>
-                  <div style={{ display: "flex", gap: 12 }}>
-                    <div>
-                      <label style={{ fontSize: 9, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 4 }}>n</label>
-                      <div style={{ display: "flex" }}>
-                        {[["sqrt", "√n"], ["log", "㏒n"]].map(([val, lbl]) => (
-                          <button key={val} onClick={() => setUtilityMode(val)}
-                            style={{ padding: "5px 11px", fontSize: 12, fontFamily: "inherit", cursor: "pointer", background: utilityMode === val ? ACCENT : BG, color: utilityMode === val ? BG : TEXT, border: `1px solid ${utilityMode === val ? ACCENT : BORDER}`, borderRadius: val === "sqrt" ? "6px 0 0 6px" : "0 6px 6px 0", fontWeight: utilityMode === val ? 600 : 400 }}>{lbl}</button>
-                        ))}
-                      </div>
-                    </div>
-                    <div>
-                      <label style={{ fontSize: 9, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 4 }}>Certainty</label>
-                      <div style={{ display: "flex" }}>
-                        {[["top", "Top"], ["entropy", "Entropy"]].map(([val, lbl]) => (
-                          <button key={val} onClick={() => setCertaintyMode(val)}
-                            style={{ padding: "5px 11px", fontSize: 12, fontFamily: "inherit", cursor: "pointer", background: certaintyMode === val ? ACCENT : BG, color: certaintyMode === val ? BG : TEXT, border: `1px solid ${certaintyMode === val ? ACCENT : BORDER}`, borderRadius: val === "top" ? "6px 0 0 6px" : "0 6px 6px 0", fontWeight: certaintyMode === val ? 600 : 400 }}>{lbl}</button>
-                        ))}
-                      </div>
-                    </div>
+                <div>
+                  <label style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 4 }}>Weight</label>
+                  <div style={{ display: "flex" }}>
+                    {[["sqrt", "√n"], ["log", "㏒n"]].map(([val, lbl]) => (
+                      <button key={val} onClick={() => setUtilityMode(val)}
+                        style={{ padding: "6px 12px", fontSize: 12, fontFamily: "inherit", cursor: "pointer", background: utilityMode === val ? ACCENT : CARD, color: utilityMode === val ? BG : TEXT, border: `1px solid ${utilityMode === val ? ACCENT : BORDER}`, borderRadius: val === "sqrt" ? "6px 0 0 6px" : "0 6px 6px 0", fontWeight: utilityMode === val ? 600 : 400 }}>{lbl}</button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <label style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 4 }}>Certainty</label>
+                  <div style={{ display: "flex" }}>
+                    {[["top", "Top"], ["entropy", "Entropy"]].map(([val, lbl]) => (
+                      <button key={val} onClick={() => setCertaintyMode(val)}
+                        style={{ padding: "6px 12px", fontSize: 12, fontFamily: "inherit", cursor: "pointer", background: certaintyMode === val ? ACCENT : CARD, color: certaintyMode === val ? BG : TEXT, border: `1px solid ${certaintyMode === val ? ACCENT : BORDER}`, borderRadius: val === "top" ? "6px 0 0 6px" : "0 6px 6px 0", fontWeight: certaintyMode === val ? 600 : 400 }}>{lbl}</button>
+                    ))}
                   </div>
                 </div>
                 {FEATURE_COLUMNS.filter((c) => c !== "FIELD_ZONE").map((col) => {

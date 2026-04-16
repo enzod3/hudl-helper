@@ -2,6 +2,8 @@
 
 Apriori-based route tendency mining from Hudl film data. Built for DB coaches and defensive coordinators.
 
+![Hudl Helper dashboard](screenshots/dashboard.png)
+
 ## Quick Start
 
 ```bash
@@ -9,7 +11,7 @@ npm install
 npm run dev
 ```
 
-Opens at `http://localhost:3000`
+Opens at `http://localhost:3000`. On first load it auto-imports a sample game from `public/sample-film/jhclips.json` so you can click around immediately — just delete it from the sidebar when you're ready to load real film.
 
 ## Build for Production
 
