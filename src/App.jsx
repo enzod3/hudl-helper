@@ -1,5 +1,6 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import { aprioriMine } from "./apriori";
+import { parseHudlJson, prepRows, FEATURES, TARGETS, TARGET_BY_ID, featureValues, outcomeSummary } from "./tags";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from "recharts";
 
 const ACCENT = "#D4A843";
@@ -12,15 +13,13 @@ const GREEN = "#3FB950";
 const RED = "#F85149";
 const BLUE = "#58A6FF";
 
-const FEATURE_COLUMNS = ["DOWN_CATEGORY", "DISTANCE_CATEGORY", "FIELD_ZONE", "OFF FORM", "BACKFIELD"];
-const TARGET_MAP = { F: "F ROUTES", B: "B ROUTES", FULL: "FULL FIELD ROUTES", RP: "PLAY_TYPE_NORM" };
-const RP_MODE = "RP";
 
-const SCOUTING_SYSTEM_PROMPT = `You are an elite football defensive coordinator and film analyst. You are writing a scouting report for your coaching staff based on data-mined route tendency data from an opponent's passing game.
+const SCOUTING_SYSTEM_PROMPT = `You are an elite football defensive coordinator and film analyst. You are writing a scouting report for your coaching staff based on data-mined tendency data from an opponent's offense.
 
 You will receive structured tendency data that was mined using association rule mining (Apriori algorithm) from Hudl film. Each tendency includes:
 - A SITUATION (combination of down, distance, field zone, formation, backfield alignment)
-- A ROUTE DISTRIBUTION (what routes they run and at what percentages)
+- A DISTRIBUTION of what they call (run/pass, pass concept, routes, run scheme or direction, depending on the view)
+- OUTCOMES (avg gain, success rate, first-down rate) showing how well it works for them
 - PLAY COUNT (sample size)
 - CERTAINTY (how predictable they are — the probability of their #1 route)
 - UTILITY SCORE (combines sample size and certainty — higher = more actionable)
@@ -48,109 +47,26 @@ STYLE RULES:
 - No intro fluff. Start with the summary immediately.`;
 
 
-function parseHudlJson(data) {
-  const clips = data.clipsWithTags || [];
-  return clips.map((clip) => {
-    const row = { clipId: clip.clipId };
-    for (const tag of clip.tags || []) {
-      const key = tag.key?.includes(". ") ? tag.key.split(". ").slice(1).join(". ") : tag.key;
-      row[key] = tag.values?.[0] ?? null;
-    }
-    return row;
-  });
-}
-
-function computeFieldY(yardStr) {
-  try {
-    const raw = parseInt(String(yardStr).trim(), 10);
-    if (isNaN(raw) || raw === 0) return null;
-    return raw < 0 ? Math.abs(raw) : 100 - raw;
-  } catch { return null; }
-}
-
-function assignFieldZone(y) {
-  if (y == null) return null;
-  if (y >= 1 && y <= 15) return "Backed Up (1-15)";
-  if (y >= 16 && y <= 60) return "Open Field (16-60)";
-  if (y >= 61 && y <= 80) return "The Fringe (61-80)";
-  if (y >= 81 && y <= 90) return "Red Zone (81-90)";
-  if (y >= 91 && y <= 99) return "Gold Zone (91-99)";
-  return null;
-}
-
-function assignAllFieldZones(y) {
-  if (y == null) return [];
-  const zones = [];
-  if (y >= 1 && y <= 15) zones.push("Backed Up (1-15)");
-  if (y >= 16 && y <= 60) zones.push("Open Field (16-60)");
-  if (y >= 61 && y <= 80) zones.push("The Fringe (61-80)");
-  if (y >= 81 && y <= 90) zones.push("Red Zone (81-90)");
-  if (y >= 91 && y <= 99) zones.push("Gold Zone (91-99)");
-  if (y >= 81 && y <= 99) zones.push("20 & In (81-99)");
-  return zones;
-}
-
-function prepRows(rows) {
-  let df = rows.map((r) => ({ ...r }));
-  df.forEach((r) => {
-    const dist = parseFloat(r["DIST"]);
-    if (!isNaN(dist)) {
-      r.DIST_NUM = dist;
-      if (dist >= 1 && dist <= 3) r.DISTANCE_CATEGORY = "Short (1-3)";
-      else if (dist >= 4 && dist <= 7) r.DISTANCE_CATEGORY = "Med (4-7)";
-      else if (dist >= 8) r.DISTANCE_CATEGORY = "Long (8+)";
-    }
-    const dn = parseInt(r["DN"], 10);
-    if (!isNaN(dn)) {
-      r.DN_NUM = dn;
-      const map = { 0: "0 DN", 1: "1st DN", 2: "2nd DN", 3: "3rd DN", 4: "4th DN" };
-      r.DOWN_CATEGORY = map[dn] || null;
-    }
-    if (r["YARD LN"] != null) {
-      const y = computeFieldY(r["YARD LN"]);
-      r._fieldY = y;
-      r.FIELD_ZONE = assignFieldZone(y);
-    }
-    for (const col of FEATURE_COLUMNS) {
-      if (r[col] != null) {
-        const v = String(r[col]).trim();
-        if (["nan", "None", "Unknown", ""].includes(v)) r[col] = null;
-        else r[col] = v;
-      }
-    }
-    const pt = String(r["PLAY TYPE"] || "").trim().toUpperCase();
-    r.PLAY_TYPE_NORM = (pt === "PASS" || pt === "SCRAMBLE") ? "PASS" : "RUN";
-  });
-  df = df.filter((r) => FEATURE_COLUMNS.some((c) => r[c] != null));
-  return df;
-}
-
-function mineDistributions(df, viewMode, minPlays, forceFilters, fieldRange, utilityMode, certaintyMode) {
-  const targetCol = TARGET_MAP[viewMode];
-  let filtered = viewMode === RP_MODE
-    ? [...df]
-    : df.filter((r) => r.PLAY_TYPE_NORM === "PASS");
+function mineDistributions(df, viewMode, minPlays, forceFilters, fieldRange, utilityMode, certaintyMode, activeFeatures) {
+  const target = TARGET_BY_ID[viewMode];
+  const targetKey = `T_${target.id}`;
+  let filtered = target.plays === "ALL" ? [...df] : df.filter((r) => r.PLAY_TYPE_NORM === target.plays);
 
   if (fieldRange[0] > 1 || fieldRange[1] < 99) {
     filtered = filtered.filter((r) => r._fieldY != null && r._fieldY >= fieldRange[0] && r._fieldY <= fieldRange[1]);
   }
 
-  for (const [col, val] of Object.entries(forceFilters)) {
-    if (val && val !== "ALL") filtered = filtered.filter((r) => r[col] === val);
+  for (const [id, val] of Object.entries(forceFilters)) {
+    const f = FEATURES.find((x) => x.id === id);
+    if (f && val && val !== "ALL") filtered = filtered.filter((r) => featureValues(r, f).includes(val));
   }
 
   if (filtered.length < minPlays) return [];
 
+  const features = FEATURES.filter((f) => activeFeatures.includes(f.id));
   const transactions = filtered.map((row) => {
     const items = [];
-    for (const col of FEATURE_COLUMNS) {
-      if (col === "FIELD_ZONE") {
-        const zones = row._fieldY != null ? assignAllFieldZones(row._fieldY) : (row[col] ? [row[col]] : []);
-        for (const z of zones) items.push(`FIELD_ZONE: ${z}`);
-      } else {
-        if (row[col] != null) items.push(`${col}: ${row[col]}`);
-      }
-    }
+    for (const f of features) for (const v of featureValues(row, f)) items.push(`${f.id}: ${v}`);
     return items;
   });
 
@@ -161,37 +77,31 @@ function mineDistributions(df, viewMode, minPlays, forceFilters, fieldRange, uti
     return new Set(cols).size === cols.length;
   });
 
-  const K_total = Math.max(2, new Set(
-    filtered.map((r) => r[targetCol]).filter((v) => v != null && !["nan", "None", ""].includes(String(v).trim()))
-  ).size);
+  const K_total = Math.max(2, new Set(filtered.map((r) => r[targetKey]).filter((v) => v != null)).size);
 
   const results = [];
-  for (const { items, support } of validItemsets) {
+  for (const { items } of validItemsets) {
     const conditions = items.map((item) => {
       const idx = item.indexOf(": ");
-      return { col: item.slice(0, idx), val: item.slice(idx + 2) };
+      return { id: item.slice(0, idx), val: item.slice(idx + 2) };
     });
 
     let subset = filtered;
-    for (const { col, val } of conditions) {
-      if (col === "FIELD_ZONE") {
-        subset = subset.filter((r) => {
-          const zones = r._fieldY != null ? assignAllFieldZones(r._fieldY) : (r[col] ? [r[col]] : []);
-          return zones.includes(val);
-        });
-      } else {
-        subset = subset.filter((r) => r[col] === val);
-      }
+    for (const { id, val } of conditions) {
+      const f = FEATURES.find((x) => x.id === id);
+      subset = subset.filter((r) => featureValues(r, f).includes(val));
     }
 
-    const withTarget = subset.filter((r) => {
-      const v = r[targetCol];
-      return v != null && !["nan", "None", ""].includes(String(v).trim());
-    });
-    if (withTarget.length === 0) continue;
+    const withTarget = subset.filter((r) => r[targetKey] != null);
+    if (withTarget.length < minPlays) continue;
 
     const counts = {};
-    withTarget.forEach((r) => { const v = String(r[targetCol]).trim(); counts[v] = (counts[v] || 0) + 1; });
+    const byValue = {};
+    withTarget.forEach((r) => {
+      const v = r[targetKey];
+      counts[v] = (counts[v] || 0) + 1;
+      (byValue[v] = byValue[v] || []).push(r);
+    });
     const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
     const total = withTarget.length;
     const primaryProb = sorted[0][1] / total;
@@ -205,46 +115,59 @@ function mineDistributions(df, viewMode, minPlays, forceFilters, fieldRange, uti
       certainty = primaryProb;
     }
 
-    const distParts = sorted.map(([route, c]) => `${route} (${Math.round((c / total) * 100)}%)`);
+    const distParts = sorted.map(([v, c]) => `${v} (${Math.round((c / total) * 100)}%)`);
     const distString = distParts.length > 3
       ? distParts.slice(0, 3).join(" | ") + ` | +${distParts.length - 3} more`
       : distParts.join(" | ");
 
+    const outcome = outcomeSummary(withTarget);
     results.push({
-      situation: conditions.map((c) => c.val).join(" & "),
+      situation: conditions.map((c) => { const f = FEATURES.find((x) => x.id === c.id); return f.prefix ? `${f.prefix} ${c.val}` : c.val; }).join(" & "),
+      key: items.join("|"),
+      itemCount: items.length,
       distribution: distString,
       plays: total,
       certainty,
       utility: (utilityMode === "log" ? Math.log(total) : Math.sqrt(total)) * certainty,
-      routeBreakdown: sorted.map(([route, c]) => ({ route, count: c, pct: c / total })),
+      gain: outcome.gain?.value ?? null,
+      success: outcome.success?.value ?? null,
+      first: outcome.first?.value ?? null,
+      routeBreakdown: sorted.map(([v, c]) => ({ route: v, count: c, pct: c / total, outcome: outcomeSummary(byValue[v]) })),
     });
   }
 
-  results.sort((a, b) => b.utility - a.utility);
+  // Drop a situation when a shorter one covers exactly the same plays
+  // (e.g. "TRI X & Surface 50" when every TRI X is a 50).
+  const sameAs = new Map();
+  for (const r of results) {
+    const sig = `${r.plays}|${r.distribution}|${r.gain}`;
+    const prev = sameAs.get(sig);
+    if (!prev || r.itemCount < prev.itemCount) sameAs.set(sig, r);
+  }
+  const kept = results.filter((r) => sameAs.get(`${r.plays}|${r.distribution}|${r.gain}`) === r);
+
+  kept.sort((a, b) => b.utility - a.utility);
   const seen = new Set();
-  return results.filter((r) => { if (seen.has(r.situation)) return false; seen.add(r.situation); return true; });
+  return kept.filter((r) => { if (seen.has(r.situation)) return false; seen.add(r.situation); return true; });
 }
 
-function getUniqueValues(df, col) {
+function getUniqueValues(df, f) {
   const vals = new Set();
-  df.forEach((r) => {
-    if (col === "FIELD_ZONE") {
-      const zones = r._fieldY != null ? assignAllFieldZones(r._fieldY) : (r[col] ? [r[col]] : []);
-      zones.forEach((z) => vals.add(z));
-    } else {
-      if (r[col] != null) vals.add(r[col]);
-    }
-  });
+  df.forEach((r) => featureValues(r, f).forEach((v) => vals.add(v)));
   return ["ALL", ...Array.from(vals).sort()];
 }
 
+const fmtPct = (v) => (v == null ? "—" : `${Math.round(v * 100)}%`);
+const fmtGain = (v) => (v == null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(1)}`);
+
 function buildReportPayload(results, viewMode, totalPlays, gameLabels) {
+  const target = TARGET_BY_ID[viewMode];
   const top = results.slice(0, 30);
   const lines = top.map((r) =>
-    `SITUATION: ${r.situation}\n  ROUTES: ${r.distribution}\n  PLAYS: ${r.plays} | CERTAINTY: ${Math.round(r.certainty * 100)}% | UTILITY: ${r.utility.toFixed(2)}`
+    `SITUATION: ${r.situation}\n  ${target.label.toUpperCase()}: ${r.distribution}\n  PLAYS: ${r.plays} | CERTAINTY: ${Math.round(r.certainty * 100)}% | UTILITY: ${r.utility.toFixed(2)} | AVG GAIN: ${fmtGain(r.gain)} | SUCCESS: ${fmtPct(r.success)} | 1ST DN: ${fmtPct(r.first)}`
   );
   const gamesStr = gameLabels.length > 0 ? `\nGAMES INCLUDED: ${gameLabels.join(", ")}` : "";
-  return `VIEW MODE: ${viewMode} (${TARGET_MAP[viewMode]})\nTOTAL PASS PLAYS: ${totalPlays}${gamesStr}\nTOTAL TENDENCIES MINED: ${results.length}\n\n--- TOP ${top.length} TENDENCIES BY UTILITY ---\n\n${lines.join("\n\n")}`;
+  return `VIEW: ${target.label}\nTOTAL PLAYS: ${totalPlays}${gamesStr}\nTOTAL TENDENCIES MINED: ${results.length}\n\n--- TOP ${top.length} TENDENCIES BY UTILITY ---\n\n${lines.join("\n\n")}`;
 }
 
 const CHART_COLORS = ["#D4A843", "#3FB950", "#58A6FF", "#F85149", "#BC8CFF", "#FF7B72", "#79C0FF", "#D2A8FF"];
@@ -323,7 +246,9 @@ export default function HudlHelper() {
   const [newGameName, setNewGameName] = useState("");
   const [showNewGame, setShowNewGame] = useState(false);
 
-  const [viewMode, setViewMode] = useState("B");
+  const [viewMode, setViewMode] = useState("RP");
+  const [activeFeatures, setActiveFeatures] = useState(FEATURES.filter((f) => f.on).map((f) => f.id));
+  const [offTeam, setOffTeam] = useState("AUTO");
   const [minPlays, setMinPlays] = useState(6);
   const [filters, setFilters] = useState({});
   const [fieldRange, setFieldRange] = useState([1, 99]);
@@ -345,7 +270,7 @@ export default function HudlHelper() {
   // Auto-load sample film for testing / demo
   useEffect(() => {
     let cancelled = false;
-    fetch("sample-film/jhclips.json")
+    fetch("sample-film/jh26.json")
       .then((r) => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
       .then((json) => {
         if (cancelled) return;
@@ -353,9 +278,9 @@ export default function HudlHelper() {
         const id = uid();
         setGames([{
           id,
-          label: "Sample: JH Clips",
+          label: "Sample: JH26 (4 games)",
           enabled: true,
-          files: [{ id: uid(), fileName: "jhclips.json", rows: prepped }],
+          files: [{ id: uid(), fileName: "jh26.json", rows: prepped }],
         }]);
         setExpandedGame(id);
       })
@@ -393,13 +318,27 @@ export default function HudlHelper() {
   const removeGame = (id) => { setGames((prev) => prev.filter((g) => g.id !== id)); if (expandedGame === id) setExpandedGame(null); setExpandedRow(null); };
   const updateLabel = (id, val) => { setGames((prev) => prev.map((g) => g.id === id ? { ...g, label: val || g.label } : g)); setEditingLabel(null); };
 
-  const combinedData = useMemo(() => games.filter((g) => g.enabled).flatMap((g) => g.files.flatMap((f) => f.rows)), [games]);
+  const allData = useMemo(() => games.filter((g) => g.enabled).flatMap((g) => g.files.flatMap((f) => f.rows)), [games]);
+
+  // Which offense to scout. Hudl Assist tags the offense on every play; ODK is
+  // the fallback for exports without it.
+  const teamOptions = useMemo(() => {
+    const counts = {};
+    allData.forEach((r) => { if (r.OFF_TEAM) counts[r.OFF_TEAM] = (counts[r.OFF_TEAM] || 0) + 1; });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([t, n]) => ({ team: t, n }));
+  }, [allData]);
+  const effectiveTeam = offTeam === "AUTO" ? teamOptions[0]?.team ?? "ALL" : offTeam;
+  const combinedData = useMemo(() => {
+    if (effectiveTeam === "ALL" || teamOptions.length === 0) return allData;
+    // Clips without an offense tag are kept rather than silently dropped.
+    return allData.filter((r) => r.OFF_TEAM == null || r.OFF_TEAM === effectiveTeam);
+  }, [allData, effectiveTeam, teamOptions]);
   const enabledCount = games.filter((g) => g.enabled).length;
 
   const results = useMemo(() => {
     if (combinedData.length === 0) return [];
-    return mineDistributions(combinedData, viewMode, minPlays, filters, fieldRange, utilityMode, certaintyMode);
-  }, [combinedData, viewMode, minPlays, filters, fieldRange, utilityMode, certaintyMode]);
+    return mineDistributions(combinedData, viewMode, minPlays, filters, fieldRange, utilityMode, certaintyMode, activeFeatures);
+  }, [combinedData, viewMode, minPlays, filters, fieldRange, utilityMode, certaintyMode, activeFeatures]);
 
   const sortedResults = useMemo(() => {
     const r = [...results];
@@ -419,7 +358,7 @@ export default function HudlHelper() {
   const filterOptions = useMemo(() => {
     if (combinedData.length === 0) return {};
     const opts = {};
-    for (const col of FEATURE_COLUMNS) opts[col] = getUniqueValues(combinedData, col);
+    for (const f of FEATURES) opts[f.id] = getUniqueValues(combinedData, f);
     return opts;
   }, [combinedData]);
 
@@ -443,7 +382,7 @@ export default function HudlHelper() {
           model: "gpt-4o", max_tokens: 1500, temperature: 0.4,
           messages: [
             { role: "system", content: SCOUTING_SYSTEM_PROMPT },
-            { role: "user", content: `Here is the mined tendency data for this opponent's passing game. Write the scouting report.\n\n${payload}` },
+            { role: "user", content: `Here is the mined tendency data for this opponent (${viewLabel} view). Write the scouting report.\n\n${payload}` },
           ],
         }),
       });
@@ -454,7 +393,9 @@ export default function HudlHelper() {
     finally { setReportLoading(false); }
   };
 
-  const filterLabels = { DOWN_CATEGORY: "Down", DISTANCE_CATEGORY: "Distance", FIELD_ZONE: "Field Zone", "OFF FORM": "Formation", BACKFIELD: "Backfield" };
+  const viewLabel = TARGET_BY_ID[viewMode].label;
+  const featureCounts = useMemo(() => Object.fromEntries(FEATURES.map((f) => [f.id, combinedData.filter((r) => featureValues(r, f).length > 0).length])), [combinedData]);
+  const toggleFeature = (id) => { setActiveFeatures((prev) => prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]); setExpandedRow(null); };
 
   const renderReport = (text) => text.split("\n").map((line, i) => {
     const t = line.trim();
@@ -600,13 +541,28 @@ export default function HudlHelper() {
           {hasData && (
             <>
               <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "flex-end", marginBottom: 12 }}>
+                {teamOptions.length > 0 && (
+                  <div>
+                    <label style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 4 }}>Offense</label>
+                    <select value={offTeam} onChange={(e) => { setOffTeam(e.target.value); setFilters({}); setExpandedRow(null); }}
+                      style={{ background: CARD, color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 10px", fontSize: 12, fontFamily: "inherit", cursor: "pointer" }}>
+                      <option value="AUTO">{teamOptions[0].team} ({teamOptions[0].n})</option>
+                      {teamOptions.slice(1).map(({ team, n }) => <option key={team} value={team}>{team} ({n})</option>)}
+                      <option value="ALL">All teams</option>
+                    </select>
+                  </div>
+                )}
                 <div>
-                  <label style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 4 }}>View</label>
+                  <label style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 4 }}>Predict</label>
                   <div style={{ display: "flex" }}>
-                    {[["F", "F"], ["B", "B"], ["FULL", "FULL"], ["RP", "R/P"]].map(([m, label], idx, arr) => (
-                      <button key={m} onClick={() => { setViewMode(m); setExpandedRow(null); }}
-                        style={{ padding: "6px 14px", fontSize: 12, fontFamily: "inherit", cursor: "pointer", background: viewMode === m ? ACCENT : CARD, color: viewMode === m ? BG : TEXT, border: `1px solid ${viewMode === m ? ACCENT : BORDER}`, borderRadius: idx === 0 ? "6px 0 0 6px" : idx === arr.length - 1 ? "0 6px 6px 0" : 0, fontWeight: viewMode === m ? 600 : 400 }}>{label}</button>
-                    ))}
+                    <select value={viewMode} onChange={(e) => { setViewMode(e.target.value); setExpandedRow(null); }}
+                      style={{ background: ACCENT, color: BG, border: `1px solid ${ACCENT}`, borderRadius: 6, padding: "6px 10px", fontSize: 12, fontFamily: "inherit", cursor: "pointer", fontWeight: 600 }}>
+                      {[["ALL", "All plays"], ["PASS", "Pass plays"], ["RUN", "Run plays"]].map(([plays, grp]) => (
+                        <optgroup key={plays} label={grp}>
+                          {TARGETS.filter((t) => t.plays === plays).map((t) => <option key={t.id} value={t.id}>{t.label}</option>)}
+                        </optgroup>
+                      ))}
+                    </select>
                   </div>
                 </div>
                 <div>
@@ -632,12 +588,12 @@ export default function HudlHelper() {
                     ))}
                   </div>
                 </div>
-                {FEATURE_COLUMNS.filter((c) => c !== "FIELD_ZONE").map((col) => {
+                {FEATURES.filter((f) => f.id !== "FIELD_ZONE" && activeFeatures.includes(f.id)).map(({ id: col, label }) => {
                   const opts = filterOptions[col];
                   if (!opts || opts.length <= 2) return null;
                   return (
                     <div key={col}>
-                      <label style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 4 }}>{filterLabels[col] || col}</label>
+                      <label style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", display: "block", marginBottom: 4 }}>{label}</label>
                       <select value={filters[col] || "ALL"} onChange={(e) => { setFilters({ ...filters, [col]: e.target.value }); setExpandedRow(null); }}
                         style={{ background: CARD, color: TEXT, border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 10px", fontSize: 12, fontFamily: "inherit", cursor: "pointer", minWidth: 120 }}>
                         {opts.map((v) => <option key={v} value={v}>{v}</option>)}
@@ -653,6 +609,20 @@ export default function HudlHelper() {
                 </button>
               </div>
 
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center", marginBottom: 12 }}>
+                <span style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", marginRight: 4 }}>Mine on</span>
+                {FEATURES.map((f) => {
+                  const on = activeFeatures.includes(f.id);
+                  const n = featureCounts[f.id] || 0;
+                  return (
+                    <button key={f.id} onClick={() => toggleFeature(f.id)} title={`Tagged on ${n} of ${combinedData.length} plays`}
+                      style={{ padding: "4px 10px", fontSize: 11, fontFamily: "inherit", cursor: "pointer", borderRadius: 12, background: on ? `${ACCENT}22` : "transparent", color: on ? ACCENT : n === 0 ? BORDER : MUTED, border: `1px solid ${on ? ACCENT + "80" : BORDER}` }}>
+                      {f.label} <span style={{ fontSize: 9, opacity: 0.7 }}>{combinedData.length ? Math.round((n / combinedData.length) * 100) : 0}%</span>
+                    </button>
+                  );
+                })}
+              </div>
+
               <div style={{ background: CARD, border: `1px solid ${BORDER}`, borderRadius: 8, padding: "12px 16px", marginBottom: 20 }}>
                 <FieldRangeSlider range={fieldRange} onChange={(r) => { setFieldRange(r); setExpandedRow(null); }} />
               </div>
@@ -662,7 +632,7 @@ export default function HudlHelper() {
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16 }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                       <span style={{ fontSize: 16 }}>⚡</span>
-                      <span style={{ fontSize: 12, fontWeight: 700, color: ACCENT, fontFamily: "'Space Grotesk', sans-serif", textTransform: "uppercase", letterSpacing: "0.06em" }}>AI Scouting Report — {viewMode === "RP" ? "R/P" : viewMode} View</span>
+                      <span style={{ fontSize: 12, fontWeight: 700, color: ACCENT, fontFamily: "'Space Grotesk', sans-serif", textTransform: "uppercase", letterSpacing: "0.06em" }}>AI Scouting Report — {viewLabel} View</span>
                       {report && <span style={{ fontSize: 10, color: MUTED, marginLeft: 8 }}>{enabledCount} game{enabledCount !== 1 ? "s" : ""} · GPT-4o</span>}
                     </div>
                     <div style={{ display: "flex", gap: 8 }}>
@@ -717,11 +687,14 @@ export default function HudlHelper() {
                       <thead>
                         <tr style={{ borderBottom: `1px solid ${BORDER}` }}>
                           {[
-                            { key: "situation", label: "Situation", w: "30%" },
-                            { key: "distribution", label: `${viewMode === "RP" ? "R/P" : viewMode} Distribution`, w: "34%" },
-                            { key: "plays", label: "Plays", w: "9%" },
-                            { key: "certainty", label: "Certainty", w: "12%" },
-                            { key: "utility", label: "Utility", w: "12%" },
+                            { key: "situation", label: "Situation", w: "24%" },
+                            { key: "distribution", label: viewLabel, w: "30%" },
+                            { key: "plays", label: "Plays", w: "6%" },
+                            { key: "certainty", label: "Certainty", w: "9%" },
+                            { key: "utility", label: "Utility", w: "7%" },
+                            { key: "gain", label: "Avg Gain", w: "8%" },
+                            { key: "success", label: "Success", w: "8%" },
+                            { key: "first", label: "1st Dn", w: "8%" },
                           ].map(({ key, label, w }) => (
                             <th key={key} onClick={() => handleSort(key)}
                               style={{ width: w, textAlign: key === "situation" || key === "distribution" ? "left" : "center", padding: "10px 12px", fontSize: 10, color: MUTED, fontWeight: 500, textTransform: "uppercase", letterSpacing: "0.06em", cursor: "pointer", userSelect: "none", whiteSpace: "nowrap" }}>
@@ -746,11 +719,14 @@ export default function HudlHelper() {
                                 </span>
                               </td>
                               <td style={{ padding: "10px 12px", textAlign: "center", fontWeight: 600, color: ACCENT }}>{r.utility.toFixed(2)}</td>
+                              <td style={{ padding: "10px 12px", textAlign: "center", color: r.gain == null ? MUTED : r.gain >= 5 ? RED : TEXT }}>{fmtGain(r.gain)}</td>
+                              <td style={{ padding: "10px 12px", textAlign: "center", color: r.success == null ? MUTED : r.success >= 0.5 ? RED : GREEN }}>{fmtPct(r.success)}</td>
+                              <td style={{ padding: "10px 12px", textAlign: "center", color: MUTED }}>{fmtPct(r.first)}</td>
                             </tr>
                             {expandedRow === i && (
                               <tr key={`exp-${i}`}>
-                                <td colSpan={5} style={{ padding: "12px 24px 16px", background: "rgba(212,168,67,0.03)", borderBottom: `1px solid ${BORDER}` }}>
-                                  <div style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", marginBottom: 8, letterSpacing: "0.06em" }}>Route Breakdown</div>
+                                <td colSpan={8} style={{ padding: "12px 24px 16px", background: "rgba(212,168,67,0.03)", borderBottom: `1px solid ${BORDER}` }}>
+                                  <div style={{ fontSize: 10, color: MUTED, textTransform: "uppercase", marginBottom: 8, letterSpacing: "0.06em" }}>{viewLabel} Breakdown · avg gain / success</div>
                                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                                     {r.routeBreakdown.map((rb, j) => (
                                       <div key={j} style={{ display: "flex", alignItems: "center", gap: 6, background: CARD, border: `1px solid ${BORDER}`, borderRadius: 6, padding: "6px 12px" }}>
@@ -760,6 +736,7 @@ export default function HudlHelper() {
                                         <span style={{ fontSize: 11, color: "#FFF", fontWeight: 500 }}>{rb.route}</span>
                                         <span style={{ fontSize: 11, color: MUTED }}>{Math.round(rb.pct * 100)}%</span>
                                         <span style={{ fontSize: 10, color: MUTED }}>({rb.count})</span>
+                                        <span style={{ fontSize: 10, color: TEXT, marginLeft: 4 }}>{fmtGain(rb.outcome.gain?.value ?? null)} · {fmtPct(rb.outcome.success?.value ?? null)}</span>
                                       </div>
                                     ))}
                                   </div>

@@ -11,7 +11,7 @@ npm install
 npm run dev
 ```
 
-Opens at `http://localhost:3000`. On first load it auto-imports a sample game from `public/sample-film/jhclips.json` so you can click around immediately — just delete it from the sidebar when you're ready to load real film.
+Opens at `http://localhost:3000`. On first load it auto-imports the JH26 sample film (4 games) from `public/sample-film/jh26.json` so you can click around immediately — just delete it from the sidebar when you're ready to load real film.
 
 ## Build for Production
 
@@ -44,7 +44,7 @@ vercel
 1. **Create games** in the sidebar (e.g. "vs Lincoln Wk3", "vs Central Wk5")
 2. **Upload Hudl JSON exports** to each game (multiple files per game)
 3. **Toggle games on/off** to combine data across matchups
-4. **Adjust filters** — view mode (F/B/Full), min plays, down, distance, formation, backfield
+4. **Pick what to predict** (run/pass, pass concept, pass family, direction, target, routes, run family/scheme/direction) and which tags to mine on (down, distance, field zone, personnel, surface, formation, backfield, hash, motion, quarter, score, clock, previous play, first play of drive). Each situation shows avg gain, success rate and first-down rate
 5. **Field position slider** — drag handles to limit by field zone, or use presets (20 & In, Backed Up, etc.)
 6. **AI Scouting Report** — paste your OpenAI API key and hit ⚡ to generate a full written breakdown
 
