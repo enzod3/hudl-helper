@@ -90,6 +90,7 @@ def torso_features(img, m):
 
 
 FOOT_HEAD = None   # (model, device) when --foot-head is given
+DET_GATE = 0       # --det-gate N: drop SAM observations in runs of >= N frames that no detector box confirms
 
 
 def load_foot_head(path):
@@ -152,11 +153,12 @@ def iou_track(frames_boxes, thr=0.3, max_miss=5):
     return out
 
 
-def load_view_det(pair, v, suffix, sam_obs=None):
+def load_view_det(pair, v, suffix, sam_obs=None, bt_suffix=None):
     """Observations from per-frame RF-DETR detections (field-masked dets_all) over the SAM tracking window, linked
     by an IoU tracker (ids offset by 2000). Feet from the ground-contact head when loaded, else box bottom-centre;
     team colour from a box-interior torso rectangle. With sam_obs (adaptive mode): a detection overlapping another
-    detection (IoU >= 0.1) is replaced by the SAM observation of that frame whose box matches it (IoU >= 0.4)."""
+    detection (IoU >= 0.1) is replaced by the SAM observation of that frame whose box matches it (IoU >= 0.4).
+    With bt_suffix: boxes and ids come from track_det.py (track_<view><bt_suffix>/tracks.json, ByteTrack-style)."""
     sync = json.load(open(os.path.join(pair, "sync.json")))
     cal = json.load(open(os.path.join(pair, v, "calib.json")))
     tdir = os.path.join(pair, f"track_{v}{suffix}")
@@ -165,8 +167,13 @@ def load_view_det(pair, v, suffix, sam_obs=None):
     frames = sorted(os.listdir(os.path.join(tdir, "frames")))
     a0, n = meta["source_frame_start"], meta["num_frames"]
     snap, pts = sync[v]["snap_pts"], cal["pts_s"]
-    boxes_pf = [[d["box_xyxy"] for d in dets[a0 + k]["detections"]] for k in range(n)]
-    ids_pf = iou_track(boxes_pf)
+    if bt_suffix:
+        bt = json.load(open(os.path.join(pair, f"track_{v}{bt_suffix}", "tracks.json")))["frames"]
+        boxes_pf = [[o["box_xyxy"] for o in bt[k]["objects"]] if k < len(bt) else [] for k in range(n)]
+        ids_pf = [[o["id"] for o in bt[k]["objects"]] if k < len(bt) else [] for k in range(n)]
+    else:
+        boxes_pf = [[d["box_xyxy"] for d in dets[a0 + k]["detections"]] for k in range(n)]
+        ids_pf = iou_track(boxes_pf)
     sam_by_k = {}
     for o in (sam_obs or []):
         sam_by_k.setdefault(o["k"], []).append(o)
@@ -234,7 +241,37 @@ def load_view(pair, v, suffix):
             obs.append({"view": v, "sam_id": int(o["id"]), "k": k, "sf": sf, "tau": round(pts[sf] - snap, 4),
                         "xy": p, "cov": C, "box": [x1, y1, x2, y2], "foot": (fu, fv), "foot_src": src,
                         "col": torso_features(img, m), "calib_res": cal["info"][sf]["residual_px"]})
+    if DET_GATE > 0:
+        obs = det_gate(obs, json.load(open(os.path.join(pair, v, "dets_all.json")))["frames"], DET_GATE)
     return obs, cal, meta
+
+
+def det_gate(obs, dets, n_min, iou_min=0.3):
+    """Detector-gated SAM: an observation is confirmed when some RF-DETR box (kept or field-mask dropped) of that frame
+    overlaps its mask box (IoU >= iou_min). Runs of >= n_min consecutive unconfirmed observations of one SAM id are
+    removed (mask drifted onto turf / another object / merged); shorter gaps (occlusion) are kept."""
+    by = {}
+    for o in obs:
+        by.setdefault(o["sam_id"], []).append(o)
+    out = []
+    for sid, rows in by.items():
+        rows.sort(key=lambda o: o["k"])
+        ok = []
+        for o in rows:
+            D = [d["box_xyxy"] for d in dets[o["sf"]]["detections"] + dets[o["sf"]].get("dropped", [])]
+            ok.append(max([box_iou(o["box"], b) for b in D], default=0.0) >= iou_min)
+        i = 0
+        while i < len(rows):
+            if ok[i]:
+                out.append(rows[i]); i += 1; continue
+            j = i
+            while j < len(rows) and not ok[j] and rows[j]["k"] - rows[i]["k"] == j - i:
+                j += 1
+            if j - i < n_min:
+                out += rows[i:j]
+            i = j
+    return out
+
 
 
 # ---------------------------------------------------------------- teams
@@ -634,6 +671,37 @@ def rematch_single_view(ents, on_box, min_frac=0.6, min_common=10):
     return [e for k, e in enumerate(ents) if k not in drop], merges
 
 
+def fit_ez_maps(ents, NF, win=30, half=15, min_pairs=20):
+    """Pass-1 cross-camera pairs (frames where an entity holds both a Wide and an End Zone observation) -> per window
+    of `win` frames a robust affine map End Zone field position -> Wide field position, fitted on the pairs within
+    +-half frames around the window (iteratively reweighted: residuals > max(1 yd, 2.5 x median) dropped)."""
+    pairs = []
+    for e in ents:
+        for f, lst in e["obs"].items():
+            w = [o for v, o, _ in lst if v == "wide"]; z = [o for v, o, _ in lst if v == "ez"]
+            if w and z:
+                ow = min(w, key=lambda o: np.trace(o["cov"])); oz = min(z, key=lambda o: np.trace(o["cov"]))
+                pairs.append((f, oz["xy"], ow["xy"]))
+    maps = {}
+    for w0 in range(0, NF, win):
+        s_ = [(e_, w_) for f, e_, w_ in pairs if w0 - half <= f < w0 + win + half]
+        if len(s_) < min_pairs:
+            continue
+        E = np.array([a for a, _ in s_]); W = np.array([b for _, b in s_])
+        A = np.c_[E, np.ones(len(E))]; keep = np.ones(len(E), bool)
+        for _ in range(3):
+            M = np.linalg.lstsq(A[keep], W[keep], rcond=None)[0]
+            r = np.linalg.norm(A @ M - W, axis=1); keep = r < max(1.0, 2.5 * float(np.median(r)))
+        maps[w0] = M
+    return maps, len(pairs)
+
+
+def map_at(maps, f, win=30):
+    if not maps:
+        return None
+    return maps[min(maps, key=lambda w0: abs(w0 + win / 2 - f))]
+
+
 def entity_track(e):
     """Per-frame mean position of an entity's observations (for merging / hygiene)."""
     return {f: np.mean([o["xy"] for _, o, _ in lst], 0) for f, lst in e["obs"].items()}
@@ -732,7 +800,7 @@ def main():
     ap.add_argument("--single-view-inflation", type=float, default=2.0)
     ap.add_argument("--assoc-gate", type=float, default=2.0, help="median cross-view distance gate (yd) for tracklet pairs")
     ap.add_argument("--assoc-min-common", type=int, default=8)
-    ap.add_argument("--obs", choices=["sam", "det", "adaptive"], default="sam",
+    ap.add_argument("--obs", choices=["sam", "det", "adaptive", "bt"], default="sam",
                     help="observations: SAM masks (full), RF-DETR detection tracks only, or detections + SAM where boxes overlap")
     ap.add_argument("--views", nargs="+", default=["wide", "ez"], help="cameras to use (single-view mode: --views wide)")
     ap.add_argument("--out-name", default="recon", help="output folder under the play folder")
@@ -744,10 +812,15 @@ def main():
     ap.add_argument("--box-assoc", type=int, default=1,
                     help="1: also match cameras by image-space box co-occupancy, re-match single-camera entities, prefer corroborated players for slots")
     ap.add_argument("--teams-per-view", type=int, default=1, help="1: classify dark / light teams within each camera separately")
+    ap.add_argument("--bt-suffix", default="_bt", help="--obs bt: read track_<view><bt-suffix>/tracks.json (track_det.py)")
+    ap.add_argument("--det-gate", type=int, default=5, help="drop SAM observations in runs of >= N frames with no confirming detector box (0 = off)")
+    ap.add_argument("--ez-refine", type=int, default=1,
+                    help="1: two-pass End Zone refinement - fit a per-1 s field mapping End Zone -> Wide on pass-1 cross-camera pairs, correct all End Zone observations, associate again")
     ap.add_argument("--max-extrapolate", type=int, default=5,
                     help="write no rows more than this many frames before a slot's first / after its last observation (-1 = write all)")
     a = ap.parse_args()
-    global FOOT_HEAD
+    global FOOT_HEAD, DET_GATE
+    DET_GATE = a.det_gate
     if a.foot_head:
         FOOT_HEAD = load_foot_head(a.foot_head)
     pair = a.pair
@@ -759,6 +832,12 @@ def main():
     for v in views:
         if v not in a.views and not os.path.exists(os.path.join(pair, f"track_{v}{a.suffix}", "masks.json")):
             O[v], CAL[v], META[v] = [], None, None   # single-view play: this camera does not exist
+            continue
+        if a.obs == "bt":
+            # detector-only tracks (track_det.py): no SAM masks are read
+            O[v], CAL[v], META[v], obs_mode_info[v] = load_view_det(pair, v, a.suffix, None, a.bt_suffix)
+            if v not in a.views:
+                O[v] = []
             continue
         O[v], CAL[v], META[v] = load_view(pair, v, a.suffix)
         if a.extra_suffix and a.obs == "sam" and os.path.exists(os.path.join(pair, f"track_{v}{a.extra_suffix}", "masks.json")):
@@ -889,10 +968,20 @@ def main():
     # image needs the cross-view and noise-model biases added back.
     ez_back = bias_applied + nb["ez"]
 
+    ez_maps = {}
+
+    def to_ez_frame(xy, f):
+        """Wide-aligned field position -> End Zone (bias-corrected) frame: inverse of the pass-1 map when refined."""
+        M = map_at(ez_maps, f) if ez_maps else None
+        if M is None:
+            return np.asarray(xy, float)
+        L = np.array([[M[0, 0], M[1, 0]], [M[0, 1], M[1, 1]]])
+        return np.linalg.solve(L, np.asarray(xy, float) - M[2])
+
     def on_box(view, xy, o):
         if CAL[view] is None:
             return False
-        q = np.asarray(xy, float) + (ez_back if view == "ez" else 0.0)
+        q = (to_ez_frame(xy, frame_of(o["tau"])) + ez_back) if view == "ez" else np.asarray(xy, float)
         p = np.array(CAL[view]["H"][o["sf"]]) @ np.array([q[0], q[1], 1.0])
         if abs(p[2]) < 1e-12:
             return False
@@ -901,13 +990,34 @@ def main():
     box_support = None
     if a.box_assoc and CAL["ez"] is not None and "ez" in a.views and "wide" in a.views:
         box_support = lambda tw, te, common: float(np.mean([on_box("ez", tw["obs"][f]["xy"], te["obs"][f]) for f in common]))
-    ents0, assoc_stats = window_associate(TR, NF, gate_yd=a.assoc_gate, box_support=box_support)
-    ents, n_merged = merge_time_disjoint(ents0)
-    ents, n_paired = pair_single_view(ents, gate_yd=a.pair_gate)
-    rematched = []
-    if box_support is not None:
-        ents, rematched = rematch_single_view(ents, on_box)
-    snap_f = frame_of(0.0)
+    def associate_all():
+        e0, st = window_associate(TR, NF, gate_yd=a.assoc_gate, box_support=box_support)
+        e1, nm = merge_time_disjoint(e0)
+        e1, npair = pair_single_view(e1, gate_yd=a.pair_gate)
+        rm = []
+        if box_support is not None:
+            e1, rm = rematch_single_view(e1, on_box)
+        return e0, st, e1, nm, npair, rm
+
+    ents0, assoc_stats, ents, n_merged, n_paired, rematched = associate_all()
+    ez_refine = {"applied": False}
+    ez_maps = {}
+    if a.ez_refine and CAL["ez"] is not None and "ez" in a.views and "wide" in a.views:
+        # two-pass End Zone refinement: the field mapping of the End Zone camera disagrees with the Wide one by ~1 yd
+        # in a way that varies over the field and the clip; fit it per 1 s window on pass-1 cross-camera pairs, correct
+        # every End Zone observation (in place: tracklets share the observation dicts), then associate again
+        ez_maps, n_pairs = fit_ez_maps(ents, NF)
+        if ez_maps:
+            singles_before = sum(1 for e in ents if len(entity_views(e)) == 1)
+            for o in O["ez"]:
+                M = map_at(ez_maps, frame_of(o["tau"]))
+                o["xy_ez"] = o["xy"]
+                o["xy"] = np.r_[o["xy"], 1.0] @ M
+            ents0, assoc_stats, ents, n_merged, n_paired, rematched = associate_all()
+            ez_refine = {"applied": True, "pairs": n_pairs, "windows": len(ez_maps),
+                         "single_camera_entities_pass1": singles_before,
+                         "single_camera_entities_pass2": sum(1 for e in ents if len(entity_views(e)) == 1)}
+    snap_f = min(max(frame_of(0.0), 0), NF - 1)   # clips whose first observation comes after the snap
     for e in ents:
         tr_ = entity_track(e)
         e["track"] = tr_
@@ -1129,7 +1239,7 @@ def main():
                           "verified": src in ("fused", "fused_split"),
                           "obs_sideline": [round(float(c), 3) for c in per_view["wide"]["xy"] + nb["wide"]] if "wide" in per_view else None,
                           "obs_endzone": [round(float(c), 3) for c in per_view["ez"]["xy"] + nb["ez"]] if "ez" in per_view else None,
-                          "obs_endzone_raw": [round(float(c), 3) for c in (per_view["ez"]["xy"] + nb["ez"] + bias_applied)] if "ez" in per_view else None})
+                          "obs_endzone_raw": [round(float(c), 3) for c in (per_view["ez"].get("xy_ez", per_view["ez"]["xy"]) + nb["ez"] + bias_applied)] if "ez" in per_view else None})
     with open(os.path.join(out_dir, "recon.jsonl"), "w") as fh:
         for l in lines:
             fh.write(json.dumps(l) + "\n")
@@ -1159,8 +1269,17 @@ def main():
         "players_associated_def": "slots with >= 10 fused (both-view) frames",
         "single_view_inflation": a.single_view_inflation,
         "box_assoc": a.box_assoc, "single_view_rematched": rematched, "extrapolated_rows_dropped": extrapolated_rows_dropped,
+        "ez_refine": ez_refine,
     }
     json.dump(summary, open(os.path.join(out_dir, "recon_summary.json"), "w"), indent=1)
+    if ez_maps:
+        # affine Wide-aligned field -> End Zone camera's own field frame, per frame (overlay.py draws with it)
+        em = {}
+        for f in range(NF):
+            M = map_at(ez_maps, f)
+            L = np.array([[M[0, 0], M[1, 0]], [M[0, 1], M[1, 1]]]); Li = np.linalg.inv(L)
+            em[f] = np.c_[Li, -Li @ M[2] + ez_back].round(6).tolist()
+        json.dump(em, open(os.path.join(out_dir, "ez_map.json"), "w"))
     json.dump({"association": assoc_stats,
                "slots": [{"player_id": p, "team": t, "frames_fused": sum(1 for s_ in e["srcs"].values() if s_ == "fused"),
                           "frames_observed": len(e["srcs"]), "segments": e["segments"], "merged_from": e.get("merged_from")}

@@ -10,7 +10,8 @@ foreshortened like the field), coloured by team (A dark, B light), the slot labe
 projected positions. Ring style by source: solid thick = fused (both views), dashed = one view, thin grey = inferred.
 Also the line of scrimmage at the snap (recon_summary.json) projected onto the field, and t from the snap.
 Slot positions are in the Wide-aligned field frame (recon.py removes the End Zone's cross-view bias and noise-model
-bias before fusing); in the End Zone view they are drawn in that camera's own frame, i.e. with both biases added back.
+bias before fusing); in the End Zone view they are drawn in that camera's own frame, i.e. with both biases added back,
+or, when recon.py refined the End Zone mapping per 1 s window (ez_map.json), through that frame's inverse map.
 Writes PAIR_DIR/<recon-name>/overlay_<view>.mp4 and, with --stack, overlay_stack.mp4 (wide | ez on top, the
 bird's-eye replay.mp4 below, 1920x1080).
 """
@@ -76,7 +77,15 @@ def view_shift(rd, v):
     return sh
 
 
-def render_view(pair, v, rows_by_f, NF, grid_t, los, width, shift=np.zeros(2)):
+def view_map(rd, v):
+    """Per-frame affine Wide-aligned field -> camera v's own field frame (ez_map.json from recon.py), or None."""
+    p = os.path.join(rd, "ez_map.json")
+    if v != "ez" or not os.path.exists(p):
+        return None
+    return {int(k): np.array(m) for k, m in json.load(open(p)).items()}
+
+
+def render_view(pair, v, rows_by_f, NF, grid_t, los, width, shift=np.zeros(2), fmap=None):
     """Returns the list of overlay frames (BGR, width x width*9/16) for one view, one per recon frame."""
     cal = json.load(open(os.path.join(pair, v, "calib.json")))
     sync = json.load(open(os.path.join(pair, "sync.json")))
@@ -86,10 +95,15 @@ def render_view(pair, v, rows_by_f, NF, grid_t, los, width, shift=np.zeros(2)):
     hgt = int(round(1080 * s / 2) * 2)
     trail = {}   # player_id -> list of (frame, field xy)
     out = []
+    def to_view(f, x, y):
+        if fmap is not None and f in fmap:
+            return tuple(fmap[f] @ np.array([x, y, 1.0]))
+        return (x + shift[0], y + shift[1])
+
     for f in range(NF):
         sf = int(np.argmin(np.abs(rel - grid_t[f])))
         for r in rows_by_f.get(f, []):
-            trail.setdefault(r["player_id"], []).append((f, (r["x_yards"] + shift[0], r["y_yards"] + shift[1])))
+            trail.setdefault(r["player_id"], []).append((f, to_view(f, r["x_yards"], r["y_yards"])))
         if abs(rel[sf] - grid_t[f]) > 0.5 / FPS:
             img = np.zeros((hgt, width, 3), np.uint8)
             cv2.putText(img, f"{v}: no frame at t = {grid_t[f]:+.2f} s", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
@@ -99,14 +113,14 @@ def render_view(pair, v, rows_by_f, NF, grid_t, los, width, shift=np.zeros(2)):
         img = cv2.resize(cv2.imread(os.path.join(pair, v, "frames", frames[sf])), (width, hgt), interpolation=cv2.INTER_AREA)
         Hs = np.diag([s, s, 1.0]) @ H
         if los is not None and np.isfinite(los):
-            lp = project(Hs, np.c_[np.full(80, los + shift[0]), np.linspace(0, FIELD_W, 80)], sg)
+            lp = project(Hs, np.array([to_view(f, los, yy) for yy in np.linspace(0, FIELD_W, 80)]), sg)
             polyline_clipped(img, lp, (0, 220, 255), 2)
         for r in rows_by_f.get(f, []):
             team, src = r["team"], r["source"]
             col = TEAM_COL[team] if src != "inferred" else INFERRED
             tr = [xy for g, xy in trail[r["player_id"]] if g > f - FPS]
             polyline_clipped(img, project(Hs, tr, sg), col, 1)
-            ring = project(Hs, RING + [r["x_yards"] + shift[0], r["y_yards"] + shift[1]], sg)
+            ring = project(Hs, RING + list(to_view(f, r["x_yards"], r["y_yards"])), sg)
             if not np.isfinite(ring).all():
                 continue
             ring = ring.astype(np.int32)
@@ -151,7 +165,7 @@ def main():
     views = [v for v in a.views if os.path.exists(os.path.join(a.pair, v, "calib.json"))]
     vids = {}
     for v in views:
-        fr = render_view(a.pair, v, rows_by_f, NF, grid_t, los, a.width, view_shift(rd, v))
+        fr = render_view(a.pair, v, rows_by_f, NF, grid_t, los, a.width, view_shift(rd, v), view_map(rd, v))
         p = writer(os.path.join(rd, f"overlay_{v}{a.suffix}.mp4"), fr[0].shape[1], fr[0].shape[0])
         for im in fr:
             p.stdin.write(im.tobytes())
