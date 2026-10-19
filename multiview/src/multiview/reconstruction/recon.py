@@ -477,12 +477,15 @@ def merge_second_pass(tracks, max_med_yd=1.0, min_overlap=5):
     return out, n
 
 
-def window_associate(TR, NF, gate_yd=2.5, win=15, min_obs=3, cont_cost=0.3, vel_w=0.05):
+def window_associate(TR, NF, gate_yd=2.5, win=15, min_obs=3, cont_cost=0.3, vel_w=0.05, box_support=None, box_min=0.6):
     """Nodes = (view, track, window) segments with >= min_obs observations in a 0.5 s window. Links: within-view
     continuity (same track, consecutive windows, cost cont_cost) and cross-view matches found per window by Hungarian
     on (median distance over shared observed frames / gate + vel_w * |velocity difference| yd/s), team-compatible,
     gated at gate_yd. Links are added cheapest first (Kruskal-style) unless the merged component would hold two
-    different tracks of the same view in the same window. Components = entities."""
+    different tracks of the same view in the same window. Components = entities.
+    box_support(wide_track, ez_track, frames) -> fraction of frames where the Wide position, projected into the End
+    Zone image, falls on the End Zone track's own box: pairs beyond the yard gate are still linked when that fraction is
+    >= box_min (End Zone foot points in a crowd can be yards off along the field while the box is the right player)."""
     nodes = {}
     for v in ("wide", "ez"):
         for ti, t in enumerate(TR[v]):
@@ -503,7 +506,7 @@ def window_associate(TR, NF, gate_yd=2.5, win=15, min_obs=3, cont_cost=0.3, vel_
         return np.linalg.lstsq(A, p, rcond=None)[0][0]
 
     n_win = (NF + win - 1) // win
-    cross_found = 0
+    cross_found = box_links = 0
     for w in range(n_win):
         W = [(ti, fs) for (v, ti, ww), fs in nodes.items() if v == "wide" and ww == w]
         E = [(ti, fs) for (v, ti, ww), fs in nodes.items() if v == "ez" and ww == w]
@@ -520,10 +523,14 @@ def window_associate(TR, NF, gate_yd=2.5, win=15, min_obs=3, cont_cost=0.3, vel_
                 if len(common) < min_obs:
                     continue
                 d = float(np.median([np.linalg.norm(tw["obs"][f]["xy"] - te["obs"][f]["xy"]) for f in common]))
-                if d > gate_yd:
-                    continue
                 dv = float(np.linalg.norm(vel(tw, common) - vel(te, common)))
-                C[i, j] = d / gate_yd + vel_w * dv
+                if d <= gate_yd:
+                    C[i, j] = d / gate_yd + vel_w * dv
+                elif box_support is not None:
+                    s_ = box_support(tw, te, common)
+                    if s_ >= box_min:
+                        C[i, j] = 1.0 + (1.0 - s_) + vel_w * dv
+                        box_links += 1
         r, c = linear_sum_assignment(C)
         for i, j in zip(r, c):
             if C[i, j] < 1e5:
@@ -579,7 +586,52 @@ def window_associate(TR, NF, gate_yd=2.5, win=15, min_obs=3, cont_cost=0.3, vel_
                 ei = owner.get((v, ti, w - 1), owner.get((v, ti, w + 1)))
                 if ei is not None:
                     ents[ei]["obs"].setdefault(f, []).append((v, o, ti))
-    return ents, {"nodes": len(nodes), "cross_candidates": cross_found, **accepted}
+    return ents, {"nodes": len(nodes), "cross_candidates": cross_found, "cross_by_box": box_links, **accepted}
+
+
+def under_box(box, u, v):
+    """Image point (u, v) under the player in box: inside the box widened by 25% of its width, from 40% of its height
+    down to 25% of its height below its bottom, or within 12 px of its bottom-centre."""
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    return bool((x1 - 0.25 * w <= u <= x2 + 0.25 * w and y1 + 0.4 * h <= v <= y2 + 0.25 * h)
+                or np.hypot(u - (x1 + x2) / 2, v - y2) <= 12)
+
+
+def entity_views(e):
+    return {v for lst in e["obs"].values() for v, _, _ in lst}
+
+
+def rematch_single_view(ents, on_box, min_frac=0.6, min_common=10):
+    """A single-camera entity is the same player as a same-team entity carrying the other camera when, on their
+    common frames, that entity's other-camera position projected into this camera falls on this entity's own box
+    (on_box(view, xy_from_other_view, own_obs)). Its observations are merged into the best such entity instead of
+    becoming a slot of their own."""
+    def first(e, f, v):
+        return next((o for vv, o, _ in e["obs"].get(f, []) if vv == v), None)
+    drop, merges = set(), []
+    for i, e in enumerate(ents):
+        vs = entity_views(e)
+        if len(vs) != 1 or e["team"] not in ("A", "B"):
+            continue
+        v = next(iter(vs)); other = "wide" if v == "ez" else "ez"
+        best = None
+        for k, q in enumerate(ents):
+            if k == i or k in drop or q["team"] != e["team"] or other not in entity_views(q):
+                continue
+            fr = [f for f in e["obs"] if first(q, f, other) is not None]
+            if len(fr) < min_common:
+                continue
+            frac = float(np.mean([on_box(v, first(q, f, other)["xy"], first(e, f, v)) for f in fr]))
+            if frac >= min_frac and (best is None or frac > best[0]):
+                best = (frac, k, len(fr))
+        if best:
+            frac, k, n = best
+            for f, lst in e["obs"].items():
+                ents[k]["obs"].setdefault(f, []).extend(lst)
+            ents[k]["segments"] += e["segments"]
+            drop.add(i); merges.append({"view": v, "frames": n, "box_frac": round(frac, 2)})
+    return [e for k, e in enumerate(ents) if k not in drop], merges
 
 
 def entity_track(e):
@@ -689,6 +741,11 @@ def main():
     ap.add_argument("--split-yd", type=float, default=1.5, help="line splitting radius (yd); 0 = off")
     ap.add_argument("--pair-gate", type=float, default=4.0, help="entity-level Wide-only/EZ-only pairing gate (yd)")
     ap.add_argument("--max-from-los", type=float, default=18.0, help="drop entities deeper than this behind the LOS on their own side at the snap (yd)")
+    ap.add_argument("--box-assoc", type=int, default=1,
+                    help="1: also match cameras by image-space box co-occupancy, re-match single-camera entities, prefer corroborated players for slots")
+    ap.add_argument("--teams-per-view", type=int, default=1, help="1: classify dark / light teams within each camera separately")
+    ap.add_argument("--max-extrapolate", type=int, default=5,
+                    help="write no rows more than this many frames before a slot's first / after its last observation (-1 = write all)")
     a = ap.parse_args()
     global FOOT_HEAD
     if a.foot_head:
@@ -802,7 +859,16 @@ def main():
         sig["empirical_crossview_residual_std_xy"] = np.std(emp, 0).round(3).tolist()
 
     # ---- 3. teams
-    labels, feats = classify_teams(O)
+    if a.teams_per_view:
+        # jersey brightness differs between the cameras (lighting, front/back vs side view): split dark / light within
+        # each camera, so 'A = darker team' holds in both views instead of one camera's light team landing in A
+        labels, feats = {}, {}
+        for v in views:
+            if O[v]:
+                lv, fv = classify_teams({v: O[v]})
+                labels.update(lv); feats.update(fv)
+    else:
+        labels, feats = classify_teams(O)
     json.dump({"labels": {f"{k[0]}:{k[1]}": v for k, v in labels.items()},
                "features": {f"{k[0]}:{k[1]}": {kk: round(vv, 3) for kk, vv in f.items()} for k, f in feats.items()}},
               open(os.path.join(out_dir, "teams.json"), "w"), indent=1)
@@ -818,9 +884,29 @@ def main():
         SW += sw
 
     # ---- 5. segment-level association -> entities, then merge time-disjoint same-team entities
-    ents0, assoc_stats = window_associate(TR, NF, gate_yd=a.assoc_gate)
+    # image-space co-occupancy: a position from one camera, projected into the other camera's image at that
+    # observation's frame, falls on that observation's box. Positions are in the Wide-aligned frame; the End Zone
+    # image needs the cross-view and noise-model biases added back.
+    ez_back = bias_applied + nb["ez"]
+
+    def on_box(view, xy, o):
+        if CAL[view] is None:
+            return False
+        q = np.asarray(xy, float) + (ez_back if view == "ez" else 0.0)
+        p = np.array(CAL[view]["H"][o["sf"]]) @ np.array([q[0], q[1], 1.0])
+        if abs(p[2]) < 1e-12:
+            return False
+        return under_box(o["box"], p[0] / p[2], p[1] / p[2])
+
+    box_support = None
+    if a.box_assoc and CAL["ez"] is not None and "ez" in a.views and "wide" in a.views:
+        box_support = lambda tw, te, common: float(np.mean([on_box("ez", tw["obs"][f]["xy"], te["obs"][f]) for f in common]))
+    ents0, assoc_stats = window_associate(TR, NF, gate_yd=a.assoc_gate, box_support=box_support)
     ents, n_merged = merge_time_disjoint(ents0)
     ents, n_paired = pair_single_view(ents, gate_yd=a.pair_gate)
+    rematched = []
+    if box_support is not None:
+        ents, rematched = rematch_single_view(ents, on_box)
     snap_f = frame_of(0.0)
     for e in ents:
         tr_ = entity_track(e)
@@ -879,7 +965,9 @@ def main():
     slots = []
     for team in ("A", "B"):
         cand = [e for e in keep if e["team"] == team]
-        cand.sort(key=lambda e: (-e["onfield"], -e["n_obs"]))
+        # players confirmed by both cameras first (>= 10 fused frames), then by observation count: a single-camera
+        # entity only takes a slot when fewer than 11 corroborated players exist
+        cand.sort(key=lambda e: (e["both_views"] < 10 if a.box_assoc else 0, -e["onfield"], -e["n_obs"]))
         slots += [(team, e) for e in cand[:11]]
         if len(cand) > 11:
             dropped[f"excess_{team}"] = len(cand) - 11
@@ -1010,8 +1098,14 @@ def main():
         return bool(0 <= u < 1920 and 0 <= w_ < 1080)
 
     lines = []
+    extrapolated_rows_dropped = 0
     for pid, team, e in final:
+        obs_f = sorted(e["srcs"])
+        lo_f, hi_f = obs_f[0] - a.max_extrapolate, obs_f[-1] + a.max_extrapolate
         for f in range(NF):
+            if a.max_extrapolate >= 0 and not (lo_f <= f <= hi_f):
+                extrapolated_rows_dropped += 1   # never seen this early / late: no position is written
+                continue
             xy, P, observed, vel = e["sm"][f]
             vis = {}
             for v in views:
@@ -1032,6 +1126,7 @@ def main():
                           "position_confidence": round(float(np.exp(-sd / 1.0)), 3),
                           "speed_yps": round(float(np.linalg.norm(vel)), 2),
                           "visibility": vis, "source": src, "estimated": src == "inferred", "conflict": f in e["conflict"],
+                          "verified": src in ("fused", "fused_split"),
                           "obs_sideline": [round(float(c), 3) for c in per_view["wide"]["xy"] + nb["wide"]] if "wide" in per_view else None,
                           "obs_endzone": [round(float(c), 3) for c in per_view["ez"]["xy"] + nb["ez"]] if "ez" in per_view else None,
                           "obs_endzone_raw": [round(float(c), 3) for c in (per_view["ez"]["xy"] + nb["ez"] + bias_applied)] if "ez" in per_view else None})
@@ -1063,6 +1158,7 @@ def main():
         "line_split_frames": split_frames, "line_split_debug": split_dbg,
         "players_associated_def": "slots with >= 10 fused (both-view) frames",
         "single_view_inflation": a.single_view_inflation,
+        "box_assoc": a.box_assoc, "single_view_rematched": rematched, "extrapolated_rows_dropped": extrapolated_rows_dropped,
     }
     json.dump(summary, open(os.path.join(out_dir, "recon_summary.json"), "w"), indent=1)
     json.dump({"association": assoc_stats,

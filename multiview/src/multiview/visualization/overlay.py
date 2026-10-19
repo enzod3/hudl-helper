@@ -9,6 +9,8 @@ H(t) (field yards -> image px) and drawn at the player's feet: a ring of 0.6 yd 
 foreshortened like the field), coloured by team (A dark, B light), the slot label, a trail of the last ~1 s of
 projected positions. Ring style by source: solid thick = fused (both views), dashed = one view, thin grey = inferred.
 Also the line of scrimmage at the snap (recon_summary.json) projected onto the field, and t from the snap.
+Slot positions are in the Wide-aligned field frame (recon.py removes the End Zone's cross-view bias and noise-model
+bias before fusing); in the End Zone view they are drawn in that camera's own frame, i.e. with both biases added back.
 Writes PAIR_DIR/<recon-name>/overlay_<view>.mp4 and, with --stack, overlay_stack.mp4 (wide | ez on top, the
 bird's-eye replay.mp4 below, 1920x1080).
 """
@@ -63,7 +65,18 @@ def dashed(img, pts, col, th):
         cv2.line(img, tuple(pts[i]), tuple(pts[i + 1]), col, th, cv2.LINE_AA)
 
 
-def render_view(pair, v, rows_by_f, NF, grid_t, los, width):
+def view_shift(rd, v):
+    """Offset from the Wide-aligned slot frame to camera v's own field frame (zero for Wide)."""
+    if v != "ez":
+        return np.zeros(2)
+    s = json.load(open(os.path.join(rd, "recon_summary.json")))
+    sh = np.array(s["bias"]["ez_minus_wide_median_yd"]) if s["bias"].get("applied", True) else np.zeros(2)
+    if s.get("noise_model") and os.path.exists(s["noise_model"]):
+        sh = sh + np.array(json.load(open(s["noise_model"]))["noise_model"]["e"]["bias_xy"])
+    return sh
+
+
+def render_view(pair, v, rows_by_f, NF, grid_t, los, width, shift=np.zeros(2)):
     """Returns the list of overlay frames (BGR, width x width*9/16) for one view, one per recon frame."""
     cal = json.load(open(os.path.join(pair, v, "calib.json")))
     sync = json.load(open(os.path.join(pair, "sync.json")))
@@ -76,7 +89,7 @@ def render_view(pair, v, rows_by_f, NF, grid_t, los, width):
     for f in range(NF):
         sf = int(np.argmin(np.abs(rel - grid_t[f])))
         for r in rows_by_f.get(f, []):
-            trail.setdefault(r["player_id"], []).append((f, (r["x_yards"], r["y_yards"])))
+            trail.setdefault(r["player_id"], []).append((f, (r["x_yards"] + shift[0], r["y_yards"] + shift[1])))
         if abs(rel[sf] - grid_t[f]) > 0.5 / FPS:
             img = np.zeros((hgt, width, 3), np.uint8)
             cv2.putText(img, f"{v}: no frame at t = {grid_t[f]:+.2f} s", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
@@ -86,14 +99,14 @@ def render_view(pair, v, rows_by_f, NF, grid_t, los, width):
         img = cv2.resize(cv2.imread(os.path.join(pair, v, "frames", frames[sf])), (width, hgt), interpolation=cv2.INTER_AREA)
         Hs = np.diag([s, s, 1.0]) @ H
         if los is not None and np.isfinite(los):
-            lp = project(Hs, np.c_[np.full(80, los), np.linspace(0, FIELD_W, 80)], sg)
+            lp = project(Hs, np.c_[np.full(80, los + shift[0]), np.linspace(0, FIELD_W, 80)], sg)
             polyline_clipped(img, lp, (0, 220, 255), 2)
         for r in rows_by_f.get(f, []):
             team, src = r["team"], r["source"]
             col = TEAM_COL[team] if src != "inferred" else INFERRED
             tr = [xy for g, xy in trail[r["player_id"]] if g > f - FPS]
             polyline_clipped(img, project(Hs, tr, sg), col, 1)
-            ring = project(Hs, RING + [r["x_yards"], r["y_yards"]], sg)
+            ring = project(Hs, RING + [r["x_yards"] + shift[0], r["y_yards"] + shift[1]], sg)
             if not np.isfinite(ring).all():
                 continue
             ring = ring.astype(np.int32)
@@ -113,7 +126,7 @@ def render_view(pair, v, rows_by_f, NF, grid_t, los, width):
             cv2.putText(img, lab, (x - tw // 2, y + th + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                         TEXT_COL[team] if src != "inferred" else (0, 0, 0), 1, cv2.LINE_AA)
         cv2.rectangle(img, (0, 0), (width, 30), (0, 0, 0), -1)
-        cv2.putText(img, f"{v}  t = {grid_t[f]:+.2f} s from snap   solid = both views, dashed = one view, grey = inferred,"
+        cv2.putText(img, f"{v}  t = {grid_t[f]:+.2f} s from snap   solid = both cameras, dashed = one camera, grey = inferred,"
                     f" yellow = LOS", (8, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
         out.append(img)
     return out
@@ -124,6 +137,7 @@ def main():
     ap.add_argument("pair"); ap.add_argument("--recon-name", default="recon")
     ap.add_argument("--views", nargs="+", default=["wide", "ez"]); ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--stack", action="store_true")
+    ap.add_argument("--suffix", default="", help="output name suffix, e.g. _v2 -> overlay_wide_v2.mp4")
     a = ap.parse_args()
     rd = os.path.join(a.pair, a.recon_name)
     rows = [json.loads(l) for l in open(os.path.join(rd, "recon.jsonl"))]
@@ -137,16 +151,16 @@ def main():
     views = [v for v in a.views if os.path.exists(os.path.join(a.pair, v, "calib.json"))]
     vids = {}
     for v in views:
-        fr = render_view(a.pair, v, rows_by_f, NF, grid_t, los, a.width)
-        p = writer(os.path.join(rd, f"overlay_{v}.mp4"), fr[0].shape[1], fr[0].shape[0])
+        fr = render_view(a.pair, v, rows_by_f, NF, grid_t, los, a.width, view_shift(rd, v))
+        p = writer(os.path.join(rd, f"overlay_{v}{a.suffix}.mp4"), fr[0].shape[1], fr[0].shape[0])
         for im in fr:
             p.stdin.write(im.tobytes())
         p.stdin.close(); p.wait()
         vids[v] = fr
-        print(v, len(fr), "frames ->", os.path.join(rd, f"overlay_{v}.mp4"))
+        print(v, len(fr), "frames ->", os.path.join(rd, f"overlay_{v}{a.suffix}.mp4"))
     if a.stack:
         cap = cv2.VideoCapture(os.path.join(rd, "replay.mp4"))
-        p = writer(os.path.join(rd, "overlay_stack.mp4"), 1920, 1080)
+        p = writer(os.path.join(rd, f"overlay_stack{a.suffix}.mp4"), 1920, 1080)
         for f in range(NF):
             canvas = np.zeros((1080, 1920, 3), np.uint8)
             for k, v in enumerate(views[:2]):
@@ -159,7 +173,7 @@ def main():
                 canvas[540:540 + rep.shape[0], x0:x0 + rep.shape[1]] = rep
             p.stdin.write(canvas.tobytes())
         p.stdin.close(); p.wait()
-        print("stack ->", os.path.join(rd, "overlay_stack.mp4"))
+        print("stack ->", os.path.join(rd, f"overlay_stack{a.suffix}.mp4"))
 
 
 if __name__ == "__main__":
