@@ -144,7 +144,11 @@ def main():
                     continue
                 if (head.get("inlier_frac_median") or 0) >= 0.6 and head.get("residual_px_median") is not None:
                     cands.append((c2[:5] != a.clip[:5], -head["inlier_frac_median"], c2, head["keyframe"]))
-            refs += [{"view_dir": f"pairs/{c2}/{v}", "frame": kfr} for _, _, c2, kfr in sorted(cands)[:8]]
+            # same-game references go before --ref-pair (a different game's keyframe can lock onto the wrong yard line)
+            ranked = sorted(cands)[:8]
+            same = [{"view_dir": f"pairs/{c2}/{v}", "frame": kfr} for other, _, c2, kfr in ranked if not other]
+            rest = [{"view_dir": f"pairs/{c2}/{v}", "frame": kfr} for other, _, c2, kfr in ranked if other]
+            refs = same + refs + rest
             json.dump({"frame": kf, "refs": refs}, open(lab, "w"))
             fh = open(os.path.join(ROOT, P, f"calib_{v}.log"), "w")
             procs.append(subprocess.Popen([PY, os.path.join(_REPO, "src/multiview/calibration/calibrate.py"), f"{P}/{v}", lab, "--view", v, "--overlay",

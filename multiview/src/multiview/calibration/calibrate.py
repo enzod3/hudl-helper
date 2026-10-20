@@ -170,6 +170,25 @@ class Fitter:
                 "inlier_frac": round(float(inl.mean()), 3), "n_visible": n}
 
 
+def on_field_frac(H, dets, margin=1.0):
+    """Fraction of a frame's field-masked detections whose foot point (box bottom-centre) maps inside the field
+    (x -margin..120+margin, y -margin..53.3+margin) through H. A wrong keyframe registration that still fits the
+    paint (yard lines repeat every 5 yd, a mirrored or shifted field) puts the players off the field."""
+    Hi = safe_inv(H)
+    D = dets["detections"]
+    if Hi is None or not D:
+        return 0.0
+    n = 0
+    for d in D:
+        x1, y1, x2, y2 = d["box_xyxy"]
+        q = Hi @ np.array([(x1 + x2) / 2, y2, 1.0])
+        if abs(q[2]) < 1e-12:
+            continue
+        x, y = q[:2] / q[2]
+        n += int(-margin <= x <= fmod.FIELD_LEN + margin and -margin <= y <= fmod.FIELD_W + margin)
+    return n / len(D)
+
+
 def camera_motion(frames_dir, frames, dets):
     """C[t]: full-res image homography frame t-1 -> t (C[0] = I), with inlier ratio."""
     Cs, q = [np.eye(3)], [1.0]
@@ -227,6 +246,10 @@ def main():
     ap.add_argument("--init-only", action="store_true")
     ap.add_argument("--reanchor-max-yd", type=float, default=3.0,
                     help="reject a keyframe re-registration that disagrees with the chained H by more than this")
+    ap.add_argument("--min-on-field-track", type=float, default=0.5,
+                    help="per-frame refits / re-anchors that put fewer than this fraction of the players on the field are rejected")
+    ap.add_argument("--min-on-field", type=float, default=0.7,
+                    help="reject a keyframe registration that puts fewer than this fraction of the players on the field")
     ap.add_argument("--anchor-every", type=int, default=30,
                     help="re-register the keyframe straight to the current frame every N frames (and after fast pans); 0=off")
     a = ap.parse_args()
@@ -245,30 +268,41 @@ def main():
     reg = None
     refs = lab.get("refs") or ([lab["ref"]] if "ref" in lab else [])
     if refs:   # register to already calibrated keyframes of the same physical camera; keep the best paint fit
-        fit.prepare(img, dets[k], a.view)
         best = None
         tried = []
-        for ref in refs:
-            rvd, rk = ref["view_dir"], ref["frame"]
-            try:
-                rc = json.load(open(os.path.join(rvd, "calib.json")))
-                rframes = sorted(f for f in os.listdir(os.path.join(rvd, "frames")) if f.endswith(".jpg"))
-                rimg = cv2.imread(os.path.join(rvd, "frames", rframes[rk]))
-                rdets = json.load(open(os.path.join(rvd, "dets_all.json")))["frames"][rk]
-                M, rg = register_to_reference(rimg, rdets, img, dets[k])
-            except Exception as ex:
-                tried.append({"ref": rvd, "error": str(ex)[:80]}); continue
-            if M is None or rg["inliers"] < 12:
-                tried.append({"ref": rvd, **rg}); continue
-            Hc = M @ np.array(rc["H"][rk]); Hc /= Hc[2, 2]
-            Hr_, _ = fit.fit(Hc, basin=4.0, iters=80)
-            Hr_, _ = fit.fit(Hr_, basin=1.0, iters=80)
-            sc_ = fit.score(Hr_)
-            tried.append({"ref": rvd, **rg, "inlier_frac": sc_["inlier_frac"], "residual_px": sc_["residual_px"]})
-            if sc_["residual_px"] is not None and (best is None or sc_["inlier_frac"] > best[0]):
-                best = (sc_["inlier_frac"], Hc, rg, rvd)
-            if best is not None and best[0] >= 0.8:
+        # if no reference gives a plausible fit at the labelled keyframe, try nearby keyframes
+        kcands = [k] + [kk for d_ in (30, -30, 60, -60, 90, -90) for kk in [k + d_] if 0 <= kk < len(frames)]
+        for kk in kcands:
+            if best is not None:
                 break
+            k = kk
+            img = cv2.imread(os.path.join(vd, "frames", frames[k]))
+            fit.prepare(img, dets[k], a.view)
+            for ref in refs:
+                rvd, rk = ref["view_dir"], ref["frame"]
+                try:
+                    rc = json.load(open(os.path.join(rvd, "calib.json")))
+                    rframes = sorted(f for f in os.listdir(os.path.join(rvd, "frames")) if f.endswith(".jpg"))
+                    rimg = cv2.imread(os.path.join(rvd, "frames", rframes[rk]))
+                    rdets = json.load(open(os.path.join(rvd, "dets_all.json")))["frames"][rk]
+                    M, rg = register_to_reference(rimg, rdets, img, dets[k])
+                except Exception as ex:
+                    tried.append({"ref": rvd, "error": str(ex)[:80]}); continue
+                if M is None or rg["inliers"] < 12:
+                    tried.append({"ref": rvd, **rg}); continue
+                Hc = M @ np.array(rc["H"][rk]); Hc /= Hc[2, 2]
+                Hr_, _ = fit.fit(Hc, basin=4.0, iters=80)
+                Hr_, _ = fit.fit(Hr_, basin=1.0, iters=80)
+                sc_ = fit.score(Hr_)
+                onf = on_field_frac(Hr_, dets[k])
+                tried.append({"ref": rvd, "keyframe": k, **rg, "inlier_frac": sc_["inlier_frac"], "residual_px": sc_["residual_px"],
+                              "on_field_frac": round(onf, 3)})
+                if onf < a.min_on_field:
+                    continue   # paint fits but the players are off the field: wrong yard-line period / mirrored field
+                if sc_["residual_px"] is not None and (best is None or sc_["inlier_frac"] > best[0]):
+                    best = (sc_["inlier_frac"], Hc, rg, rvd)
+                if best is not None and best[0] >= 0.8:
+                    break
         if best is None:
             raise SystemExit(f"calibration failed: no reference keyframe registered to frame {k} ({len(tried)} tried): {tried}")
         H0, reg = best[1], {**best[2], "ref": best[3], "tried": tried}
@@ -333,6 +367,8 @@ def main():
             inside = okp & (probe[:, 0] > 0) & (probe[:, 0] < 1920) & (probe[:, 1] > 0) & (probe[:, 1] < 1080)
             shift = float(np.median(np.linalg.norm(probe[inside] - probe_r[inside], axis=1))) if inside.any() else 1e9
             accept = sr["inlier_frac"] >= sp["inlier_frac"] - 0.02 and shift < (60 if big else 25) and safe_inv(Hr) is not None
+            if accept and len(dets[t]["detections"]) >= 5 and on_field_frac(Hr, dets[t]) < a.min_on_field_track:
+                accept = False   # degenerate / shifted refit: the paint fits but the players leave the field
             Hs[t] = Hr if accept else Hp
             info[t] = {**(sr if accept else sp), "mode": "refit" if accept else "predicted", "shift_px": round(shift, 1),
                        "cam_inlier": round(cq[max(t, prev)], 3), "wide_basin": bool(big)}
@@ -357,7 +393,8 @@ def main():
                     # (paint alone is ambiguous along the depth axis when the near sideline is hidden)
                     # but never jump more than reanchor_max_yd: yard lines repeat every 5 yd, so a wrong registration
                     # (repeating stands / scenery) can fit the paint as well as the right one
-                    if dis <= a.reanchor_max_yd and (sa["inlier_frac"] > cur["inlier_frac"] + 0.01 or
+                    plaus = len(dets[t]["detections"]) < 5 or on_field_frac(Ha, dets[t]) >= a.min_on_field_track
+                    if plaus and dis <= a.reanchor_max_yd and (sa["inlier_frac"] > cur["inlier_frac"] + 0.01 or
                                                      (dis > 0.75 and sa["inlier_frac"] >= cur["inlier_frac"] - 0.05)):
                         Hs[t] = Ha
                         info[t] = {**sa, "mode": "reanchor", "cam_inlier": cur["cam_inlier"], "reg_inliers": rinfo["inliers"],
