@@ -1,0 +1,38 @@
+# Defaults used by scripts/run_pair.py and the stage scripts. The scripts take these as CLI flags (the flag names are
+# given per entry); this file records the tested configuration and the model artefacts it ran with.
+models:
+  detector:
+    family: rfdetr            # rfdetr 1.11.2
+    variant: large            # detect.py --model
+    weights: ft/run_real2/checkpoint_best_total.pth   # run_pair.py --det-weights (omit -> COCO RFDETRLarge, class person)
+    classes: [player, official]
+    tiles: 2                  # 2x2 overlapping tiles, 20% overlap, class-wise NMS 0.5
+    threshold: 0.3
+    dtype: fp16
+  segmentation:
+    model: sam3.1_multiplex   # facebookresearch/sam3 @ 7f473cf, weights AEmotionStudio/sam3.1 mirror (safetensors)
+    multiplex_count: 16
+    dtype: fp16               # bf16 / fp32 do not run on Turing (sm_75)
+    crop_prompt: true         # segment.py --crop-prompt (re-prompt small boxes on a 3x crop)
+    min_mask_frac: 0.25
+  foot_head: foot/run1/head.pt                         # recon.py --foot-head
+pipeline:
+  track_window_s: {pre: 2.5, post: 3.5}                # run_pair.py --pre / --post (seconds around the snap)
+  field_mask: {erode_px: 12, sideline_min_coverage: 0.45, max_cut_frac: 0.2}
+  sync:
+    snap: {hi: 0.15, lo: 0.06, sustain_s: 0.5, quiet_s: 0.7, move_thr_heights: 0.10}
+    stage_c: {override_if_disagree_s: 0.5, min_margin_yd: 0.2, min_confidence: 0.2}
+  calibration:
+    anchor_every: 30                                   # calibrate.py --anchor-every
+    reanchor_max_yd: 3.0                               # calibrate.py --reanchor-max-yd
+    inlier_px: 6
+  reconstruction:
+    obs: sam                                           # recon.py --obs sam|det|adaptive
+    assoc_gate_yd: 2.5                                 # recon.py --assoc-gate
+    split_yd: 1.5                                      # recon.py --split-yd (line splitting)
+    pair_gate_yd: 4.0
+    max_from_los_yd: 18.0
+    conflict_yd: 3.0
+    single_view_inflation: 2.0
+    noise_model: calib/headnm/fit_fusion.json          # recon.py --noise-model (dot-fitted, even clip ids)
+field: configs/field_ncaa.yaml

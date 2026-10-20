@@ -1,0 +1,7 @@
+# Canonical field (yards). x along the length incl. end zones, y across; y = 0 is the sideline nearest the Wide camera.
+length_yd: 120.0          # x = 10 and x = 110 are the goal lines, x = 60 the 50
+width_yd: 53.333
+hashes: ncaa              # inner hash edges 20 / 33.33 yd from the near sideline (nfl: 23.58 / 29.75, hs: 17.78 / 35.56)
+hash_mark_len_yd: 0.667
+hash_direction: outward   # calibrate.py --hash-dir outward|inward|centered
+sideline_ticks: {inset_yd: 0.111, length_yd: 0.667}
